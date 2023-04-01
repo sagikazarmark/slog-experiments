@@ -6,7 +6,7 @@ package slog
 
 import (
 	"runtime"
-	"slices"
+	"golang.org/x/exp/slices"
 	"time"
 )
 

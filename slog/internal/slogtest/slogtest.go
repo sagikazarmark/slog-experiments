@@ -5,7 +5,7 @@
 // Package slogtest contains support functions for testing slog.
 package slogtest
 
-import "log/slog"
+import "github.com/sagikazarmark/slog-experiments/slog"
 
 // RemoveTime removes the top-level time attribute.
 // It is intended to be used as a ReplaceAttr function,

@@ -10,8 +10,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
-	"log/slog/internal/buffer"
+	"github.com/sagikazarmark/slog-experiments/slog"
+	"github.com/sagikazarmark/slog-experiments/slog/internal/buffer"
 	"strconv"
 	"time"
 )

@@ -1,9 +1,11 @@
 version: '3'
 
+shopt: [globstar]
+
 tasks:
   test:
     cmds:
-      - echo "Tests ran successfully"
+      - go build ./slog/...
 
   lint:
     cmds:
@@ -21,3 +23,10 @@ tasks:
       - defer: rm -rf go/
       - mkdir slog
       - cp -r go/src/log/slog/* slog
+      - task: patch-slog
+
+  patch-slog:
+    cmds:
+      - rm -rf slog/**/*_test.go
+      - find slog/ -type f -name '*.go' -exec sed -i 's|"log/slog|"github.com/sagikazarmark/slog-experiments/slog|g' {} +
+      - find slog/ -type f -name '*.go' -exec sed -i 's|"slices"|"golang.org/x/exp/slices"|g' {} +

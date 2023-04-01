@@ -7,7 +7,7 @@ package slog
 import (
 	"context"
 	"log"
-	"log/slog/internal"
+	"github.com/sagikazarmark/slog-experiments/slog/internal"
 	"runtime"
 	"sync/atomic"
 	"time"

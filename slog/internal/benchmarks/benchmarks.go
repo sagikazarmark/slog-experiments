@@ -25,7 +25,7 @@ package benchmarks
 
 import (
 	"errors"
-	"log/slog"
+	"github.com/sagikazarmark/slog-experiments/slog"
 	"time"
 )
 

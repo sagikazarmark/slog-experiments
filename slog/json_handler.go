@@ -11,7 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog/internal/buffer"
+	"github.com/sagikazarmark/slog-experiments/slog/internal/buffer"
 	"math"
 	"strconv"
 	"time"

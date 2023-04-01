@@ -7,7 +7,7 @@ package slog
 import (
 	"fmt"
 	"math"
-	"slices"
+	"golang.org/x/exp/slices"
 	"strconv"
 	"time"
 	"unsafe"
