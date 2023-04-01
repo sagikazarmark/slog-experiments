@@ -32,5 +32,6 @@ jobs:
         uses: peter-evans/create-pull-request@v4
         with:
           title: Update slog code
+          commit-message: "chore: update slog"
           add-paths: |
             slog/
