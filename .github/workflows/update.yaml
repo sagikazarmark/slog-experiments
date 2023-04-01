@@ -1,0 +1,26 @@
+name: Update slog
+
+on:
+  schedule:
+    - cron:  '0 0 * * 0'
+  workflow_dispatch:
+
+jobs:
+  update:
+    name: Update
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Update code
+        run: task update-slog
+        shell: nix develop .#ci -c bash {0}
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v4
+        with:
+          title: Update slog code
+          add-paths: |
+            slog/

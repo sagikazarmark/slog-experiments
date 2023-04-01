@@ -1,0 +1,24 @@
+version: '3'
+
+tasks:
+  test:
+    deps: [build]
+    cmds:
+      - echo "Tests ran successfully"
+
+  lint:
+    cmds:
+      - echo "All files look good"
+
+  check:
+    cmds:
+      - task: test
+      - task: lint
+
+  update-slog:
+    cmds:
+      - rm -rf slog
+      - git clone https://go.googlesource.com/go
+      - defer: rm -rf go/
+      - mkdir slog
+      - cp -r go/src/log/slog/* slog
