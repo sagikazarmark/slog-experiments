@@ -2,7 +2,6 @@ version: '3'
 
 tasks:
   test:
-    deps: [build]
     cmds:
       - echo "Tests ran successfully"
 
