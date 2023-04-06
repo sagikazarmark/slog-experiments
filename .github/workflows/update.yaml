@@ -29,7 +29,7 @@ jobs:
         shell: nix develop .#ci -c bash {0}
 
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v4
+        uses: peter-evans/create-pull-request@v5
         with:
           title: Update slog code
           commit-message: "chore: update slog"
