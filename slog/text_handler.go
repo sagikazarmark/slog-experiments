@@ -11,6 +11,7 @@ import (
 	"io"
 	"reflect"
 	"strconv"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -22,18 +23,18 @@ type TextHandler struct {
 }
 
 // NewTextHandler creates a TextHandler that writes to w,
-// using the default options.
-func NewTextHandler(w io.Writer) *TextHandler {
-	return (HandlerOptions{}).NewTextHandler(w)
-}
-
-// NewTextHandler creates a TextHandler with the given options that writes to w.
-func (opts HandlerOptions) NewTextHandler(w io.Writer) *TextHandler {
+// using the given options.
+// If opts is nil, the default options are used.
+func NewTextHandler(w io.Writer, opts *HandlerOptions) *TextHandler {
+	if opts == nil {
+		opts = &HandlerOptions{}
+	}
 	return &TextHandler{
 		&commonHandler{
 			json: false,
 			w:    w,
-			opts: opts,
+			opts: *opts,
+			mu:   &sync.Mutex{},
 		},
 	}
 }
@@ -138,6 +139,9 @@ func byteSlice(a any) ([]byte, bool) {
 }
 
 func needsQuoting(s string) bool {
+	if len(s) == 0 {
+		return true
+	}
 	for i := 0; i < len(s); {
 		b := s[i]
 		if b < utf8.RuneSelf {

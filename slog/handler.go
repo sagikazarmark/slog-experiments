@@ -9,13 +9,14 @@ import (
 	"fmt"
 	"io"
 	"github.com/sagikazarmark/slog-experiments/slog/internal/buffer"
+	"reflect"
 	"golang.org/x/exp/slices"
 	"strconv"
 	"sync"
 	"time"
 )
 
-// A Handler handles log records produced by a Logger..
+// A Handler handles log records produced by a Logger.
 //
 // A typical handler may print log records to standard error,
 // or write them to a file or database, or perhaps augment them
@@ -40,7 +41,7 @@ type Handler interface {
 	Enabled(context.Context, Level) bool
 
 	// Handle handles the Record.
-	// It will only be called Enabled returns true.
+	// It will only be called when Enabled returns true.
 	// The Context argument is as for Enabled.
 	// It is present solely to provide Handlers access to the context's values.
 	// Canceling the context should not affect record processing.
@@ -50,8 +51,9 @@ type Handler interface {
 	// Handle methods that produce output should observe the following rules:
 	//   - If r.Time is the zero time, ignore the time.
 	//   - If r.PC is zero, ignore it.
-	//   - If an Attr's key is the empty string and the value is not a group,
-	//     ignore the Attr.
+	//   - Attr's values should be resolved.
+	//   - If an Attr's key and value are both the zero value, ignore the Attr.
+	//     This can be tested with attr.Equal(Attr{}).
 	//   - If a group's key is empty, inline the group's Attrs.
 	//   - If a group has no Attrs (even if it has a non-empty key),
 	//     ignore it.
@@ -60,7 +62,6 @@ type Handler interface {
 	// WithAttrs returns a new Handler whose attributes consist of
 	// both the receiver's attributes and the arguments.
 	// The Handler owns the slice: it may retain, modify or discard it.
-	// [Logger.With] will resolve the Attrs.
 	WithAttrs(attrs []Attr) Handler
 
 	// WithGroup returns a new Handler with the given group appended to
@@ -87,11 +88,11 @@ type Handler interface {
 
 type defaultHandler struct {
 	ch *commonHandler
-	// log.Output, except for testing
-	output func(calldepth int, message string) error
+	// internal.DefaultOutput, except for testing
+	output func(pc uintptr, data []byte) error
 }
 
-func newDefaultHandler(output func(int, string) error) *defaultHandler {
+func newDefaultHandler(output func(uintptr, []byte) error) *defaultHandler {
 	return &defaultHandler{
 		ch:     &commonHandler{json: false},
 		output: output,
@@ -110,12 +111,10 @@ func (h *defaultHandler) Handle(ctx context.Context, r Record) error {
 	buf.WriteString(r.Level.String())
 	buf.WriteByte(' ')
 	buf.WriteString(r.Message)
-	state := h.ch.newHandleState(buf, true, " ", nil)
+	state := h.ch.newHandleState(buf, true, " ")
 	defer state.free()
 	state.appendNonBuiltIns(r)
-
-	// skip [h.output, defaultHandler.Handle, handlerWriter.Write, log.Output]
-	return h.output(4, buf.String())
+	return h.output(r.PC, *buf)
 }
 
 func (h *defaultHandler) WithAttrs(as []Attr) Handler {
@@ -129,10 +128,8 @@ func (h *defaultHandler) WithGroup(name string) Handler {
 // HandlerOptions are options for a TextHandler or JSONHandler.
 // A zero HandlerOptions consists entirely of default values.
 type HandlerOptions struct {
-	// When AddSource is true, the handler adds a ("source", "file:line")
-	// attribute to the output indicating the source code position of the log
-	// statement. AddSource is false by default to skip the cost of computing
-	// this information.
+	// AddSource causes the handler to compute the source code position
+	// of the log statement and add a SourceKey attribute to the output.
 	AddSource bool
 
 	// Level reports the minimum record level that will be logged.
@@ -144,7 +141,7 @@ type HandlerOptions struct {
 
 	// ReplaceAttr is called to rewrite each non-group attribute before it is logged.
 	// The attribute's value has been resolved (see [Value.Resolve]).
-	// If ReplaceAttr returns an Attr with Key == "", the attribute is discarded.
+	// If ReplaceAttr returns a zero Attr, the attribute is discarded.
 	//
 	// The built-in attributes with keys "time", "level", "source", and "msg"
 	// are passed to this function, except that time is omitted
@@ -182,7 +179,7 @@ const (
 	// message of the log call. The associated value is a string.
 	MessageKey = "msg"
 	// SourceKey is the key used by the built-in handlers for the source file
-	// and line of the log call. The associated value is a string.
+	// and line of the log call. The associated value is a *[Source].
 	SourceKey = "source"
 )
 
@@ -190,11 +187,15 @@ type commonHandler struct {
 	json              bool // true => output JSON; false => output text
 	opts              HandlerOptions
 	preformattedAttrs []byte
-	groupPrefix       string   // for text: prefix of groups opened in preformatting
-	groups            []string // all groups started from WithGroup
-	nOpenGroups       int      // the number of groups opened in preformattedAttrs
-	mu                sync.Mutex
-	w                 io.Writer
+	// groupPrefix is for the text handler only.
+	// It holds the prefix for groups that were already pre-formatted.
+	// A group will appear here when a call to WithGroup is followed by
+	// a call to WithAttrs.
+	groupPrefix string
+	groups      []string // all groups started from WithGroup
+	nOpenGroups int      // the number of groups opened in preformattedAttrs
+	mu          *sync.Mutex
+	w           io.Writer
 }
 
 func (h *commonHandler) clone() *commonHandler {
@@ -207,6 +208,7 @@ func (h *commonHandler) clone() *commonHandler {
 		groups:            slices.Clip(h.groups),
 		nOpenGroups:       h.nOpenGroups,
 		w:                 h.w,
+		mu:                h.mu, // mutex shared among all clones of this handler
 	}
 }
 
@@ -221,15 +223,21 @@ func (h *commonHandler) enabled(l Level) bool {
 }
 
 func (h *commonHandler) withAttrs(as []Attr) *commonHandler {
+	// We are going to ignore empty groups, so if the entire slice consists of
+	// them, there is nothing to do.
+	if countEmptyGroups(as) == len(as) {
+		return h
+	}
 	h2 := h.clone()
 	// Pre-format the attributes as an optimization.
-	prefix := buffer.New()
-	defer prefix.Free()
-	prefix.WriteString(h.groupPrefix)
-	state := h2.newHandleState((*buffer.Buffer)(&h2.preformattedAttrs), false, "", prefix)
+	state := h2.newHandleState((*buffer.Buffer)(&h2.preformattedAttrs), false, "")
 	defer state.free()
-	if len(h2.preformattedAttrs) > 0 {
+	state.prefix.WriteString(h.groupPrefix)
+	if pfa := h2.preformattedAttrs; len(pfa) > 0 {
 		state.sep = h.attrSep()
+		if h2.json && pfa[len(pfa)-1] == '{' {
+			state.sep = ""
+		}
 	}
 	state.openGroups()
 	for _, a := range as {
@@ -244,16 +252,15 @@ func (h *commonHandler) withAttrs(as []Attr) *commonHandler {
 }
 
 func (h *commonHandler) withGroup(name string) *commonHandler {
-	if name == "" {
-		return h
-	}
 	h2 := h.clone()
 	h2.groups = append(h2.groups, name)
 	return h2
 }
 
+// handle is the internal implementation of Handler.Handle
+// used by TextHandler and JSONHandler.
 func (h *commonHandler) handle(r Record) error {
-	state := h.newHandleState(buffer.New(), true, "", nil)
+	state := h.newHandleState(buffer.New(), true, "")
 	defer state.free()
 	if h.json {
 		state.buf.WriteByte('{')
@@ -284,22 +291,7 @@ func (h *commonHandler) handle(r Record) error {
 	}
 	// source
 	if h.opts.AddSource {
-		frame := r.frame()
-		if frame.File != "" {
-			key := SourceKey
-			if rep == nil {
-				state.appendKey(key)
-				state.appendSource(frame.File, frame.Line)
-			} else {
-				buf := buffer.New()
-				buf.WriteString(frame.File) // TODO: escape?
-				buf.WriteByte(':')
-				buf.WritePosInt(frame.Line)
-				s := buf.String()
-				buf.Free()
-				state.appendAttr(String(key, s))
-			}
-		}
+		state.appendAttr(Any(SourceKey, r.source()))
 	}
 	key = MessageKey
 	msg := r.Message
@@ -321,23 +313,30 @@ func (h *commonHandler) handle(r Record) error {
 
 func (s *handleState) appendNonBuiltIns(r Record) {
 	// preformatted Attrs
-	if len(s.h.preformattedAttrs) > 0 {
+	if pfa := s.h.preformattedAttrs; len(pfa) > 0 {
 		s.buf.WriteString(s.sep)
-		s.buf.Write(s.h.preformattedAttrs)
+		s.buf.Write(pfa)
 		s.sep = s.h.attrSep()
+		if s.h.json && pfa[len(pfa)-1] == '{' {
+			s.sep = ""
+		}
 	}
 	// Attrs in Record -- unlike the built-in ones, they are in groups started
 	// from WithGroup.
-	s.prefix = buffer.New()
-	defer s.prefix.Free()
-	s.prefix.WriteString(s.h.groupPrefix)
-	s.openGroups()
-	r.Attrs(func(a Attr) {
-		s.appendAttr(a)
-	})
+	// If the record has no Attrs, don't output any groups.
+	nOpenGroups := s.h.nOpenGroups
+	if r.NumAttrs() > 0 {
+		s.prefix.WriteString(s.h.groupPrefix)
+		s.openGroups()
+		nOpenGroups = len(s.h.groups)
+		r.Attrs(func(a Attr) bool {
+			s.appendAttr(a)
+			return true
+		})
+	}
 	if s.h.json {
 		// Close all open groups.
-		for range s.h.groups {
+		for range s.h.groups[:nOpenGroups] {
 			s.buf.WriteByte('}')
 		}
 		// Close the top-level object.
@@ -370,13 +369,13 @@ var groupPool = sync.Pool{New: func() any {
 	return &s
 }}
 
-func (h *commonHandler) newHandleState(buf *buffer.Buffer, freeBuf bool, sep string, prefix *buffer.Buffer) handleState {
+func (h *commonHandler) newHandleState(buf *buffer.Buffer, freeBuf bool, sep string) handleState {
 	s := handleState{
 		h:       h,
 		buf:     buf,
 		freeBuf: freeBuf,
 		sep:     sep,
-		prefix:  prefix,
+		prefix:  buffer.New(),
 	}
 	if h.opts.ReplaceAttr != nil {
 		s.groups = groupPool.Get().(*[]string)
@@ -393,6 +392,7 @@ func (s *handleState) free() {
 		*gs = (*gs)[:0]
 		groupPool.Put(gs)
 	}
+	s.prefix.Free()
 }
 
 func (s *handleState) openGroups() {
@@ -419,7 +419,6 @@ func (s *handleState) openGroup(name string) {
 	if s.groups != nil {
 		*s.groups = append(*s.groups, name)
 	}
-
 }
 
 // closeGroup ends the group with the given name.
@@ -439,26 +438,32 @@ func (s *handleState) closeGroup(name string) {
 // It handles replacement and checking for an empty key.
 // after replacement).
 func (s *handleState) appendAttr(a Attr) {
-	v := a.Value
-	// Elide a non-group with an empty key.
-	if a.Key == "" && v.Kind() != KindGroup {
-		return
-	}
-	if rep := s.h.opts.ReplaceAttr; rep != nil && v.Kind() != KindGroup {
+	if rep := s.h.opts.ReplaceAttr; rep != nil && a.Value.Kind() != KindGroup {
 		var gs []string
 		if s.groups != nil {
 			gs = *s.groups
 		}
-		a = rep(gs, Attr{a.Key, v})
-		if a.Key == "" {
-			return
-		}
-		// Although all attributes in the Record are already resolved,
-		// This one came from the user, so it may not have been.
-		v = a.Value.Resolve()
+		// Resolve before calling ReplaceAttr, so the user doesn't have to.
+		a.Value = a.Value.Resolve()
+		a = rep(gs, a)
 	}
-	if v.Kind() == KindGroup {
-		attrs := v.Group()
+	a.Value = a.Value.Resolve()
+	// Elide empty Attrs.
+	if a.isEmpty() {
+		return
+	}
+	// Special case: Source.
+	if v := a.Value; v.Kind() == KindAny {
+		if src, ok := v.Any().(*Source); ok {
+			if s.h.json {
+				a.Value = src.group()
+			} else {
+				a.Value = StringValue(fmt.Sprintf("%s:%d", src.File, src.Line))
+			}
+		}
+	}
+	if a.Value.Kind() == KindGroup {
+		attrs := a.Value.Group()
 		// Output only non-empty groups.
 		if len(attrs) > 0 {
 			// Inline a group with an empty key.
@@ -474,7 +479,7 @@ func (s *handleState) appendAttr(a Attr) {
 		}
 	} else {
 		s.appendKey(a.Key)
-		s.appendValue(v)
+		s.appendValue(a.Value)
 	}
 }
 
@@ -484,7 +489,7 @@ func (s *handleState) appendError(err error) {
 
 func (s *handleState) appendKey(key string) {
 	s.buf.WriteString(s.sep)
-	if s.prefix != nil {
+	if s.prefix != nil && len(*s.prefix) > 0 {
 		// TODO: optimize by avoiding allocation.
 		s.appendString(string(*s.prefix) + key)
 	} else {
@@ -496,26 +501,6 @@ func (s *handleState) appendKey(key string) {
 		s.buf.WriteByte('=')
 	}
 	s.sep = s.h.attrSep()
-}
-
-func (s *handleState) appendSource(file string, line int) {
-	if s.h.json {
-		s.buf.WriteByte('"')
-		*s.buf = appendEscapedJSONString(*s.buf, file)
-		s.buf.WriteByte(':')
-		s.buf.WritePosInt(line)
-		s.buf.WriteByte('"')
-	} else {
-		// text
-		if needsQuoting(file) {
-			s.appendString(file + ":" + strconv.Itoa(line))
-		} else {
-			// common case: no quoting needed.
-			s.appendString(file)
-			s.buf.WriteByte(':')
-			s.buf.WritePosInt(line)
-		}
-	}
 }
 
 func (s *handleState) appendString(str string) {
@@ -534,6 +519,23 @@ func (s *handleState) appendString(str string) {
 }
 
 func (s *handleState) appendValue(v Value) {
+	defer func() {
+		if r := recover(); r != nil {
+			// If it panics with a nil pointer, the most likely cases are
+			// an encoding.TextMarshaler or error fails to guard against nil,
+			// in which case "<nil>" seems to be the feasible choice.
+			//
+			// Adapted from the code in fmt/print.go.
+			if v := reflect.ValueOf(v.any); v.Kind() == reflect.Pointer && v.IsNil() {
+				s.appendString("<nil>")
+				return
+			}
+
+			// Otherwise just print the original panic message.
+			s.appendString(fmt.Sprintf("!PANIC: %v", r))
+		}
+	}()
+
 	var err error
 	if s.h.json {
 		err = appendJSONValue(s, v)
@@ -549,41 +551,19 @@ func (s *handleState) appendTime(t time.Time) {
 	if s.h.json {
 		appendJSONTime(s, t)
 	} else {
-		writeTimeRFC3339Millis(s.buf, t)
+		*s.buf = appendRFC3339Millis(*s.buf, t)
 	}
 }
 
-// This takes half the time of Time.AppendFormat.
-func writeTimeRFC3339Millis(buf *buffer.Buffer, t time.Time) {
-	year, month, day := t.Date()
-	buf.WritePosIntWidth(year, 4)
-	buf.WriteByte('-')
-	buf.WritePosIntWidth(int(month), 2)
-	buf.WriteByte('-')
-	buf.WritePosIntWidth(day, 2)
-	buf.WriteByte('T')
-	hour, min, sec := t.Clock()
-	buf.WritePosIntWidth(hour, 2)
-	buf.WriteByte(':')
-	buf.WritePosIntWidth(min, 2)
-	buf.WriteByte(':')
-	buf.WritePosIntWidth(sec, 2)
-	ns := t.Nanosecond()
-	buf.WriteByte('.')
-	buf.WritePosIntWidth(ns/1e6, 3)
-	_, offsetSeconds := t.Zone()
-	if offsetSeconds == 0 {
-		buf.WriteByte('Z')
-	} else {
-		offsetMinutes := offsetSeconds / 60
-		if offsetMinutes < 0 {
-			buf.WriteByte('-')
-			offsetMinutes = -offsetMinutes
-		} else {
-			buf.WriteByte('+')
-		}
-		buf.WritePosIntWidth(offsetMinutes/60, 2)
-		buf.WriteByte(':')
-		buf.WritePosIntWidth(offsetMinutes%60, 2)
-	}
+func appendRFC3339Millis(b []byte, t time.Time) []byte {
+	// Format according to time.RFC3339Nano since it is highly optimized,
+	// but truncate it to use millisecond resolution.
+	// Unfortunately, that format trims trailing 0s, so add 1/10 millisecond
+	// to guarantee that there are exactly 4 digits after the period.
+	const prefixLen = len("2006-01-02T15:04:05.000")
+	n := len(b)
+	t = t.Truncate(time.Millisecond).Add(time.Millisecond / 10)
+	b = t.AppendFormat(b, time.RFC3339Nano)
+	b = append(b[:n+prefixLen], b[n+prefixLen+1:]...) // drop the 4th digit
+	return b
 }

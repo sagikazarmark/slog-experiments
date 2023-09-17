@@ -7,8 +7,10 @@ package slog
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"golang.org/x/exp/slices"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -162,7 +164,30 @@ func DurationValue(v time.Duration) Value {
 // GroupValue returns a new Value for a list of Attrs.
 // The caller must not subsequently mutate the argument slice.
 func GroupValue(as ...Attr) Value {
+	// Remove empty groups.
+	// It is simpler overall to do this at construction than
+	// to check each Group recursively for emptiness.
+	if n := countEmptyGroups(as); n > 0 {
+		as2 := make([]Attr, 0, len(as)-n)
+		for _, a := range as {
+			if !a.Value.isEmptyGroup() {
+				as2 = append(as2, a)
+			}
+		}
+		as = as2
+	}
 	return Value{num: uint64(len(as)), any: groupptr(unsafe.SliceData(as))}
+}
+
+// countEmptyGroups returns the number of empty group values in its argument.
+func countEmptyGroups(as []Attr) int {
+	n := 0
+	for _, a := range as {
+		if a.Value.isEmptyGroup() {
+			n++
+		}
+	}
+	return n
 }
 
 // AnyValue returns a Value for the supplied value.
@@ -302,22 +327,22 @@ func (v Value) Bool() bool {
 	return v.bool()
 }
 
-func (a Value) bool() bool {
-	return a.num == 1
+func (v Value) bool() bool {
+	return v.num == 1
 }
 
 // Duration returns v's value as a time.Duration. It panics
 // if v is not a time.Duration.
-func (a Value) Duration() time.Duration {
-	if g, w := a.Kind(), KindDuration; g != w {
+func (v Value) Duration() time.Duration {
+	if g, w := v.Kind(), KindDuration; g != w {
 		panic(fmt.Sprintf("Value kind is %s, not %s", g, w))
 	}
 
-	return a.duration()
+	return v.duration()
 }
 
-func (a Value) duration() time.Duration {
-	return time.Duration(int64(a.num))
+func (v Value) duration() time.Duration {
+	return time.Duration(int64(v.num))
 }
 
 // Float64 returns v's value as a float64. It panics
@@ -330,8 +355,8 @@ func (v Value) Float64() float64 {
 	return v.float()
 }
 
-func (a Value) float() float64 {
-	return math.Float64frombits(a.num)
+func (v Value) float() float64 {
+	return math.Float64frombits(v.num)
 }
 
 // Time returns v's value as a time.Time. It panics
@@ -397,6 +422,17 @@ func (v Value) Equal(w Value) bool {
 	}
 }
 
+// isEmptyGroup reports whether v is a group that has no attributes.
+func (v Value) isEmptyGroup() bool {
+	if v.Kind() != KindGroup {
+		return false
+	}
+	// We do not need to recursively examine the group's Attrs for emptiness,
+	// because GroupValue removed them when the group was constructed, and
+	// groups are immutable.
+	return len(v.group()) == 0
+}
+
 // append appends a text representation of v to dst.
 // v is formatted as with fmt.Sprint.
 func (v Value) append(dst []byte) []byte {
@@ -436,20 +472,19 @@ const maxLogValues = 100
 
 // Resolve repeatedly calls LogValue on v while it implements LogValuer,
 // and returns the result.
-// If v resolves to a group, the group's attributes' values are also resolved.
+// If v resolves to a group, the group's attributes' values are not recursively
+// resolved.
 // If the number of LogValue calls exceeds a threshold, a Value containing an
 // error is returned.
 // Resolve's return value is guaranteed not to be of Kind KindLogValuer.
-func (v Value) Resolve() Value {
-	v = v.resolve()
-	if v.Kind() == KindGroup {
-		resolveAttrs(v.Group())
-	}
-	return v
-}
-
-func (v Value) resolve() Value {
+func (v Value) Resolve() (rv Value) {
 	orig := v
+	defer func() {
+		if r := recover(); r != nil {
+			rv = AnyValue(fmt.Errorf("LogValue panicked\n%s", stack(3, 5)))
+		}
+	}()
+
 	for i := 0; i < maxLogValues; i++ {
 		if v.Kind() != KindLogValuer {
 			return v
@@ -460,10 +495,26 @@ func (v Value) resolve() Value {
 	return AnyValue(err)
 }
 
-// resolveAttrs replaces the values of the given Attrs with their
-// resolutions.
-func resolveAttrs(as []Attr) {
-	for i, a := range as {
-		as[i].Value = a.Value.Resolve()
+func stack(skip, nFrames int) string {
+	pcs := make([]uintptr, nFrames+1)
+	n := runtime.Callers(skip+1, pcs)
+	if n == 0 {
+		return "(no stack)"
 	}
+	frames := runtime.CallersFrames(pcs[:n])
+	var b strings.Builder
+	i := 0
+	for {
+		frame, more := frames.Next()
+		fmt.Fprintf(&b, "called from %s (%s:%d)\n", frame.Function, frame.File, frame.Line)
+		if !more {
+			break
+		}
+		i++
+		if i >= nFrames {
+			fmt.Fprintf(&b, "(rest of stack elided)\n")
+			break
+		}
+	}
+	return b.String()
 }

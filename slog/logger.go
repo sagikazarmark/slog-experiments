@@ -7,20 +7,21 @@ package slog
 import (
 	"context"
 	"log"
+	loginternal "log/internal"
 	"github.com/sagikazarmark/slog-experiments/slog/internal"
 	"runtime"
 	"sync/atomic"
 	"time"
 )
 
-var defaultLogger atomic.Value
+var defaultLogger atomic.Pointer[Logger]
 
 func init() {
-	defaultLogger.Store(New(newDefaultHandler(log.Output)))
+	defaultLogger.Store(New(newDefaultHandler(loginternal.DefaultOutput)))
 }
 
 // Default returns the default Logger.
-func Default() *Logger { return defaultLogger.Load().(*Logger) }
+func Default() *Logger { return defaultLogger.Load() }
 
 // SetDefault makes l the default Logger.
 // After this call, output from the log package's default Logger
@@ -87,42 +88,35 @@ func (l *Logger) clone() *Logger {
 // Handler returns l's Handler.
 func (l *Logger) Handler() Handler { return l.handler }
 
-// With returns a new Logger that includes the given arguments, converted to
-// Attrs as in [Logger.Log] and resolved.
-// The Attrs will be added to each output from the Logger.
-// The new Logger shares the old Logger's context.
-// The new Logger's handler is the result of calling WithAttrs on the receiver's
-// handler.
+// With returns a Logger that includes the given attributes
+// in each output operation. Arguments are converted to
+// attributes as if by [Logger.Log].
 func (l *Logger) With(args ...any) *Logger {
-	var (
-		attr  Attr
-		attrs []Attr
-	)
-	for len(args) > 0 {
-		attr, args = argsToAttr(args)
-		attrs = append(attrs, attr)
+	if len(args) == 0 {
+		return l
 	}
 	c := l.clone()
-	c.handler = l.handler.WithAttrs(attrs)
+	c.handler = l.handler.WithAttrs(argsToAttrSlice(args))
 	return c
 }
 
-// WithGroup returns a new Logger that starts a group. The keys of all
-// attributes added to the Logger will be qualified by the given name.
-// (How that qualification happens depends on the [Handler.WithGroup]
+// WithGroup returns a Logger that starts a group, if name is non-empty.
+// The keys of all attributes added to the Logger will be qualified by the given
+// name. (How that qualification happens depends on the [Handler.WithGroup]
 // method of the Logger's Handler.)
-// The new Logger shares the old Logger's context.
 //
-// The new Logger's handler is the result of calling WithGroup on the receiver's
-// handler.
+// If name is empty, WithGroup returns the receiver.
 func (l *Logger) WithGroup(name string) *Logger {
+	if name == "" {
+		return l
+	}
 	c := l.clone()
 	c.handler = l.handler.WithGroup(name)
 	return c
 
 }
 
-// New creates a new Logger with the given non-nil Handler and a nil context.
+// New creates a new Logger with the given non-nil Handler.
 func New(h Handler) *Logger {
 	if h == nil {
 		panic("nil Handler")
@@ -171,41 +165,41 @@ func (l *Logger) LogAttrs(ctx context.Context, level Level, msg string, attrs ..
 
 // Debug logs at LevelDebug.
 func (l *Logger) Debug(msg string, args ...any) {
-	l.log(nil, LevelDebug, msg, args...)
+	l.log(context.Background(), LevelDebug, msg, args...)
 }
 
-// DebugCtx logs at LevelDebug with the given context.
-func (l *Logger) DebugCtx(ctx context.Context, msg string, args ...any) {
+// DebugContext logs at LevelDebug with the given context.
+func (l *Logger) DebugContext(ctx context.Context, msg string, args ...any) {
 	l.log(ctx, LevelDebug, msg, args...)
 }
 
 // Info logs at LevelInfo.
 func (l *Logger) Info(msg string, args ...any) {
-	l.log(nil, LevelInfo, msg, args...)
+	l.log(context.Background(), LevelInfo, msg, args...)
 }
 
-// InfoCtx logs at LevelInfo with the given context.
-func (l *Logger) InfoCtx(ctx context.Context, msg string, args ...any) {
+// InfoContext logs at LevelInfo with the given context.
+func (l *Logger) InfoContext(ctx context.Context, msg string, args ...any) {
 	l.log(ctx, LevelInfo, msg, args...)
 }
 
 // Warn logs at LevelWarn.
 func (l *Logger) Warn(msg string, args ...any) {
-	l.log(nil, LevelWarn, msg, args...)
+	l.log(context.Background(), LevelWarn, msg, args...)
 }
 
-// WarnCtx logs at LevelWarn with the given context.
-func (l *Logger) WarnCtx(ctx context.Context, msg string, args ...any) {
+// WarnContext logs at LevelWarn with the given context.
+func (l *Logger) WarnContext(ctx context.Context, msg string, args ...any) {
 	l.log(ctx, LevelWarn, msg, args...)
 }
 
 // Error logs at LevelError.
 func (l *Logger) Error(msg string, args ...any) {
-	l.log(nil, LevelError, msg, args...)
+	l.log(context.Background(), LevelError, msg, args...)
 }
 
-// ErrorCtx logs at LevelError with the given context.
-func (l *Logger) ErrorCtx(ctx context.Context, msg string, args ...any) {
+// ErrorContext logs at LevelError with the given context.
+func (l *Logger) ErrorContext(ctx context.Context, msg string, args ...any) {
 	l.log(ctx, LevelError, msg, args...)
 }
 
@@ -253,41 +247,41 @@ func (l *Logger) logAttrs(ctx context.Context, level Level, msg string, attrs ..
 
 // Debug calls Logger.Debug on the default logger.
 func Debug(msg string, args ...any) {
-	Default().log(nil, LevelDebug, msg, args...)
+	Default().log(context.Background(), LevelDebug, msg, args...)
 }
 
-// DebugCtx calls Logger.DebugCtx on the default logger.
-func DebugCtx(ctx context.Context, msg string, args ...any) {
+// DebugContext calls Logger.DebugContext on the default logger.
+func DebugContext(ctx context.Context, msg string, args ...any) {
 	Default().log(ctx, LevelDebug, msg, args...)
 }
 
 // Info calls Logger.Info on the default logger.
 func Info(msg string, args ...any) {
-	Default().log(nil, LevelInfo, msg, args...)
+	Default().log(context.Background(), LevelInfo, msg, args...)
 }
 
-// InfoCtx calls Logger.InfoCtx on the default logger.
-func InfoCtx(ctx context.Context, msg string, args ...any) {
+// InfoContext calls Logger.InfoContext on the default logger.
+func InfoContext(ctx context.Context, msg string, args ...any) {
 	Default().log(ctx, LevelInfo, msg, args...)
 }
 
 // Warn calls Logger.Warn on the default logger.
 func Warn(msg string, args ...any) {
-	Default().log(nil, LevelWarn, msg, args...)
+	Default().log(context.Background(), LevelWarn, msg, args...)
 }
 
-// WarnCtx calls Logger.WarnCtx on the default logger.
-func WarnCtx(ctx context.Context, msg string, args ...any) {
+// WarnContext calls Logger.WarnContext on the default logger.
+func WarnContext(ctx context.Context, msg string, args ...any) {
 	Default().log(ctx, LevelWarn, msg, args...)
 }
 
 // Error calls Logger.Error on the default logger.
 func Error(msg string, args ...any) {
-	Default().log(nil, LevelError, msg, args...)
+	Default().log(context.Background(), LevelError, msg, args...)
 }
 
-// ErrorCtx calls Logger.ErrorCtx on the default logger.
-func ErrorCtx(ctx context.Context, msg string, args ...any) {
+// ErrorContext calls Logger.ErrorContext on the default logger.
+func ErrorContext(ctx context.Context, msg string, args ...any) {
 	Default().log(ctx, LevelError, msg, args...)
 }
 
